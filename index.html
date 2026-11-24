@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>文字検出ツール</title>
+<style>
+  :root { --kb: 0px; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  #video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+  .glass { background: rgba(30,30,30,.55); color: #fff;
+    -webkit-backdrop-filter: blur(16px) saturate(1.4); backdrop-filter: blur(16px) saturate(1.4); }
+
+  #status { position: absolute; top: calc(env(safe-area-inset-top) + 12px); left: 12px;
+    padding: 6px 12px; border-radius: 999px; font-size: 13px; max-width: calc(100% - 80px); }
+  #status .dot { display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%;
+    background: #ffd600; animation: pulse 1s infinite; vertical-align: middle; }
+  #status .dot.hidden { display: none; }
+  @keyframes pulse { 50% { opacity: .25; } }
+
+  #torch { position: absolute; top: calc(env(safe-area-inset-top) + 8px); right: 12px; width: 40px; height: 40px;
+    border: 0; border-radius: 50%; font-size: 18px; display: none; }
+  #torch.on { background: #ffd600; color: #000; }
+
+  #bar { position: absolute; left: 16px; right: 16px;
+    bottom: calc(var(--kb) + env(safe-area-inset-bottom) + 24px);
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-radius: 14px; }
+  #bar svg { flex: none; opacity: .7; }
+  #q { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: #fff;
+    font-size: 17px; /* 16px未満だとiOS Safariが入力時にズームする */ }
+  #q::placeholder { color: rgba(255,255,255,.55); }
+  #clear { flex: none; border: 0; background: transparent; color: rgba(255,255,255,.7); font-size: 20px;
+    line-height: 1; padding: 0 2px; display: none; }
+
+  #error { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center;
+    justify-content: center; gap: 16px; padding: 32px; text-align: center; color: #fff; background: #111; }
+  #error button { border: 0; border-radius: 10px; padding: 10px 20px; font-size: 16px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+
+  <div id="status" class="glass"><span class="dot"></span><span id="statusText">起動中…</span></div>
+  <button id="torch" class="glass" aria-label="ライト">🔦</button>
+
+  <div id="bar" class="glass">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+    <input id="q" type="search" placeholder="検索ワードを入力..." enterkeyhint="search"
+           autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <button id="clear" aria-label="クリア">✕</button>
+  </div>
+
+  <div id="error"><div id="errorText"></div><button id="retry">再試行</button></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+'use strict';
+
+/* ================= 設定 ================= */
+const CFG = {
+  langs: ['jpn', 'eng'],
+  maxSide: 1280,        // OCRに渡す画像の長辺(小さいほど軽い/大きいほど小さい文字に強い)
+  thumbSize: 32,        // 動き検出用サムネイルの一辺
+  motionThreshold: 9,   // これ以上画面が変わったら再OCR(輝度差の平均, 0-255)
+  monitorMs: 200,       // 動き検出の間隔
+};
+
+/* ================= 要素 ================= */
+const $ = s => document.querySelector(s);
+const video = $('#video'), overlay = $('#overlay'), octx = overlay.getContext('2d');
+const input = $('#q'), clearBtn = $('#clear'), torchBtn = $('#torch');
+const statusText = $('#statusText'), statusDot = $('#status .dot');
+const errorBox = $('#error'), errorText = $('#errorText');
+
+/* ================= 状態 ================= */
+let worker = null, ready = false, loadingLabel = '', busy = false;
+let needOcr = true, moved = false;
+let lines = [];          // 直近OCR結果(行ごとの文字列+文字ボックス)。キーワード変更時はこれを再検索するだけ
+let matches = [];        // 画面に描くヒット矩形(0-1正規化, 左上原点)
+let query = '', ocrThumb = null, stream = null, track = null;
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const normQ = s => s.normalize('NFKC').toLowerCase().replace(/\s+/g, '');
+
+/* ================= カメラ ================= */
+async function startCamera() {
+  errorBox.style.display = 'none';
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return showError('カメラを使えません。HTTPS(または localhost)で開いてください。');
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false,
+    });
+  } catch (e) {
+    return showError('カメラにアクセスできません。ブラウザのカメラ許可を確認してください。\n(' + e.name + ')');
+  }
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+  track = stream.getVideoTracks()[0];
+  if (track.getCapabilities?.().torch) torchBtn.style.display = 'block';
+  needOcr = true;
+  draw();
+}
+function showError(msg) {
+  errorText.textContent = msg;
+  errorBox.style.display = 'flex';
+}
+$('#retry').onclick = startCamera;
+
+let torchOn = false;
+torchBtn.onclick = async () => {
+  try {
+    torchOn = !torchOn;
+    await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+    torchBtn.classList.toggle('on', torchOn);
+  } catch { torchOn = false; }
+};
+
+/* ================= OCR ================= */
+async function initOcr() {
+  loadingLabel = 'OCRエンジンを読み込み中';
+  refreshStatus();
+  try {
+    worker = await Tesseract.createWorker(CFG.langs, 1, {
+      logger: m => {
+        if (ready || typeof m.progress !== 'number') return;
+        loadingLabel = `OCRエンジンを読み込み中 ${Math.round(m.progress * 100)}%`;
+        refreshStatus();
+      },
+    });
+    ready = true;
+    loadingLabel = '';
+  } catch (e) {
+    console.error(e);
+    loadingLabel = 'OCRエンジンの読み込みに失敗(ネット接続を確認)';
+  }
+  refreshStatus();
+}
+
+// OCRに渡すフレーム(縮小してから渡す=軽量化)
+const frame = document.createElement('canvas'), fctx = frame.getContext('2d');
+function grabFrame() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const s = Math.min(1, CFG.maxSide / Math.max(vw, vh));
+  frame.width = Math.round(vw * s); frame.height = Math.round(vh * s);
+  fctx.drawImage(video, 0, 0, frame.width, frame.height);
+  return { w: frame.width, h: frame.height };
+}
+
+// 動き検出用の極小サムネイル(輝度のみ)
+const T = CFG.thumbSize, tcv = document.createElement('canvas');
+tcv.width = tcv.height = T;
+const tctx = tcv.getContext('2d', { willReadFrequently: true });
+function thumb() {
+  tctx.drawImage(video, 0, 0, T, T);
+  const d = tctx.getImageData(0, 0, T, T).data, g = new Uint8Array(T * T);
+  for (let i = 0; i < g.length; i++) g[i] = (d[4*i] * 77 + d[4*i+1] * 150 + d[4*i+2] * 29) >> 8;
+  return g;
+}
+function diff(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; }
+
+// Tesseractの結果 → 行ごとに「空白なし正規化文字列」と「1文字ずつのボックス」へ
+// (日本語OCRは文字間に空白が入りがちなので、空白を除いて照合する)
+function extractLines(data, W, H) {
+  const src = data.blocks
+    ? data.blocks.flatMap(b => (b.paragraphs || []).flatMap(p => p.lines || []))
+    : (data.lines || []);
+  const out = [];
+  for (const ln of src) {
+    let text = ''; const map = [], boxes = [];
+    const add = (t, b) => {
+      const n = (t || '').normalize('NFKC').toLowerCase().replace(/\s+/g, '');
+      if (!n || !b) return;
+      const id = boxes.push({ x0: b.x0 / W, y0: b.y0 / H, x1: b.x1 / W, y1: b.y1 / H }) - 1;
+      for (let k = 0; k < n.length; k++) map.push(id);
+      text += n;
+    };
+    for (const w of ln.words || []) {
+      if (w.symbols && w.symbols.length) w.symbols.forEach(s => add(s.text, s.bbox));
+      else add(w.text, w.bbox);            // 文字単位が無ければ単語単位
+    }
+    if (text) out.push({ text, map, boxes });
+  }
+  return out;
+}
+
+// キーワードに一致した範囲だけのボックスを返す(1行に複数あれば全部)
+function findMatches(q) {
+  if (!q) return [];
+  const res = [];
+  for (const ln of lines) {
+    let from = 0, i;
+    while ((i = ln.text.indexOf(q, from)) !== -1) {
+      let x0 = 1, y0 = 1, x1 = 0, y1 = 0; const seen = new Set();
+      for (let k = i; k < i + q.length; k++) {
+        const id = ln.map[k]; if (seen.has(id)) continue; seen.add(id);
+        const b = ln.boxes[id];
+        x0 = Math.min(x0, b.x0); y0 = Math.min(y0, b.y0); x1 = Math.max(x1, b.x1); y1 = Math.max(y1, b.y1);
+      }
+      res.push({ x0, y0, x1, y1 });
+      from = i + q.length;
+    }
+  }
+  return res;
+}
+
+async function runOcr() {
+  busy = true; refreshStatus();
+  try {
+    const t = thumb();
+    const { w, h } = grabFrame();
+    const { data } = await worker.recognize(frame, {}, { blocks: true });
+    lines = extractLines(data, w, h);
+    ocrThumb = t; needOcr = false; moved = false;
+    rematch();
+  } catch (e) {
+    console.error(e);
+    await sleep(1000);
+  } finally {
+    busy = false; refreshStatus();
+  }
+}
+
+// OCRは常に1つだけ・前の処理が終わってから次へ(iOS版の isProcessing 相当)
+async function ocrLoop() {
+  for (;;) {
+    await sleep(120);
+    if (!ready || busy || document.hidden || !video.videoWidth) continue;
+    if (!needOcr) continue;                    // 画面が動いていなければ再OCRしない(省電力)
+    if (!query && lines.length) continue;      // キーワード未入力ならOCRしない
+    await runOcr();
+  }
+}
+
+// 画面の動きを軽く監視。動いたら再OCRを要求、ハイライトは薄くする
+setInterval(() => {
+  if (document.hidden || !video.videoWidth) return;
+  if (!ocrThumb) { needOcr = true; return; }
+  const m = diff(thumb(), ocrThumb) > CFG.motionThreshold;
+  if (m) needOcr = true;
+  if (m !== moved) { moved = m; draw(); }
+}, CFG.monitorMs);
+
+document.addEventListener('visibilitychange', () => { if (!document.hidden) needOcr = true; });
+
+/* ================= 描画 ================= */
+function rematch() { matches = findMatches(query); refreshStatus(); draw(); }
+
+// object-fit: cover と同じ計算で、動画上の座標を画面座標に変換(iOS版の補正係数が不要)
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = overlay.clientWidth, ch = overlay.clientHeight;
+  if (overlay.width !== Math.round(cw * dpr) || overlay.height !== Math.round(ch * dpr)) {
+    overlay.width = Math.round(cw * dpr); overlay.height = Math.round(ch * dpr);
+  }
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  octx.clearRect(0, 0, cw, ch);
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!matches.length || !vw) return;
+
+  const s = Math.max(cw / vw, ch / vh);
+  const ox = (cw - vw * s) / 2, oy = (ch - vh * s) / 2;
+  const pad = 3;
+  octx.globalAlpha = moved ? 0.35 : 1;      // カメラが動いて位置がずれている間は薄く
+  octx.lineWidth = 3; octx.strokeStyle = '#ffd600'; octx.fillStyle = 'rgba(255,214,0,.25)';
+  for (const r of matches) {
+    const x = r.x0 * vw * s + ox - pad, y = r.y0 * vh * s + oy - pad;
+    const w = (r.x1 - r.x0) * vw * s + pad * 2, h = (r.y1 - r.y0) * vh * s + pad * 2;
+    octx.fillRect(x, y, w, h);
+    octx.strokeRect(x, y, w, h);
+  }
+  octx.globalAlpha = 1;
+}
+window.addEventListener('resize', draw);
+video.addEventListener('loadedmetadata', draw);
+
+/* ================= UI ================= */
+function refreshStatus() {
+  let text, dot = false;
+  if (!ready) { text = loadingLabel || '起動中…'; dot = !loadingLabel.includes('失敗'); }
+  else if (!query) text = 'キーワードを入力してください';
+  else {
+    text = matches.length ? `${matches.length}件ヒット` : '見つかりません';
+    dot = busy;
+  }
+  statusText.textContent = text;
+  statusDot.classList.toggle('hidden', !dot);
+}
+
+input.addEventListener('input', () => {
+  query = normQ(input.value);
+  clearBtn.style.display = input.value ? 'block' : 'none';
+  rematch();                 // キャッシュ済みOCR結果から即座に再検索
+});
+input.addEventListener('keydown', e => { if (e.key === 'Enter') input.blur(); });
+clearBtn.onclick = () => { input.value = ''; input.dispatchEvent(new Event('input')); };
+$('#stage').addEventListener('click', e => { if (!e.target.closest('#bar')) input.blur(); });
+
+// ソフトキーボードで検索バーが隠れないようにする
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const fit = () => document.documentElement.style.setProperty(
+    '--kb', Math.max(0, window.innerHeight - vv.height - vv.offsetTop) + 'px');
+  vv.addEventListener('resize', fit); vv.addEventListener('scroll', fit);
+}
+
+/* ================= 起動 ================= */
+startCamera();
+initOcr();
+ocrLoop();
+refreshStatus();
+</script>
+</body>
+</html>
