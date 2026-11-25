@@ -30,10 +30,11 @@
   #tools button.on { background: #ffd600; color: #000; }
   #torch { display: none; }
 
-  #panel { position: absolute; top: calc(env(safe-area-inset-top) + 56px); right: 12px; width: min(300px, calc(100% - 24px));
-    display: none; padding: 12px; border-radius: 14px; font-size: 14px; }
+  #panel { position: absolute; top: calc(env(safe-area-inset-top) + 56px); right: 12px; width: min(320px, calc(100% - 24px));
+    display: none; padding: 12px; border-radius: 14px; font-size: 14px; max-height: 70vh; overflow: auto; }
   #panel label { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 8px 0; }
-  #panel select { font-size: 14px; padding: 4px; border-radius: 6px; max-width: 170px; }
+  #panel select { font-size: 14px; padding: 4px; border-radius: 6px; max-width: 190px; }
+  #panel .hint { font-size: 11px; opacity: .65; margin: -2px 0 6px; }
   #dbgText { display: none; margin-top: 8px; max-height: 26vh; overflow: auto; white-space: pre-wrap;
     font-size: 11px; line-height: 1.35; background: rgba(0,0,0,.5); padding: 6px; border-radius: 8px; }
 
@@ -67,6 +68,21 @@
   </div>
 
   <div id="panel" class="glass">
+    <label>言語
+      <select id="lang">
+        <option value="jpn+eng">日本語+英語</option>
+        <option value="jpn">日本語のみ(速い)</option>
+        <option value="eng">英語のみ(最速)</option>
+      </select>
+    </label>
+    <label>並列数
+      <select id="pool">
+        <option value="1">1(省メモリ)</option>
+        <option value="2">2</option>
+        <option value="3">3(高性能端末向け)</option>
+      </select>
+    </label>
+    <div class="hint">言語・並列数を変えるとページが再読み込みされます</div>
     <label>認識方式
       <select id="psm">
         <option value="3">自動(標準)</option>
@@ -76,8 +92,9 @@
     </label>
     <label>解像度
       <select id="res">
+        <option value="800">最軽量(800)</option>
         <option value="960">軽い(960)</option>
-        <option value="1280" selected>標準(1280)</option>
+        <option value="1280">標準(1280)</option>
         <option value="1920">高(1920)</option>
         <option value="2560">最高(2560)</option>
       </select>
@@ -108,11 +125,16 @@
 
 /* ================= 設定 ================= */
 const CFG = {
-  langs: ['jpn', 'eng'],
-  thumbSize: 32,
-  motionThreshold: 9,
-  monitorMs: 200,
+  motionThreshold: 9,    // 前回OCRした画面からこれ以上変わったら再OCR(輝度差の平均, 0-255)
   shotMinSide: 2000,     // 撮影モードの最低解像度(長辺)
+  trackW: 160,           // 動き追従用の画像の幅
+  trackRange: 4,         // 1フレームで追従できる最大移動量(追従用画像のpx)
+  trackLostErr: 25,      // 追従の信頼度がこれを超えたら「見失い」扱い
+};
+
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
 };
 
 /* ================= 要素 ================= */
@@ -122,19 +144,33 @@ const input = $('#q'), clearBtn = $('#clear'), torchBtn = $('#torch'), gearBtn =
 const statusText = $('#statusText'), statusDot = $('#status .dot');
 const errorBox = $('#error'), errorText = $('#errorText');
 const modeBtn = $('#modeBtn'), shutterBtn = $('#shutter');
-const panel = $('#panel'), psmSel = $('#psm'), resSel = $('#res'), dbgChk = $('#dbg'), dbgText = $('#dbgText');
+const panel = $('#panel'), psmSel = $('#psm'), resSel = $('#res'), dbgChk = $('#dbg');
+const langSel = $('#lang'), poolSel = $('#pool'), dbgText = $('#dbgText');
 
 /* ================= 状態 ================= */
-let worker = null, ready = false, loadingLabel = '', busy = false;
-let needOcr = true, moved = false;
-let lines = [], matches = [];
-let query = '', ocrThumb = null, stream = null, track = null;
-let mode = 'live';          // 'live' | 'shot'
-let frozen = false;         // 撮影モードで静止画を表示中
-let debug = false, maxSide = 1280;
+const defaultPool = (navigator.hardwareConcurrency || 4) >= 6 ? 2 : 1;
+const settings = {
+  lang: store.get('lang', 'jpn+eng'),
+  pool: +store.get('pool', defaultPool),
+  psm: store.get('psm', '3'),
+  res: +store.get('res', 1280),
+  debug: store.get('debug', '0') === '1',
+};
+langSel.value = settings.lang; poolSel.value = settings.pool; psmSel.value = settings.psm;
+resSel.value = settings.res; dbgChk.checked = settings.debug;
+
+let pool = [];                 // [{w: Tesseractワーカー, busy: bool}]
+let ready = false, loadingLabel = '', shooting = false;
+let needOcr = true;
+let lines = [], matches = [];  // 直近OCR結果 / キーワード一致の矩形(0-1正規化)
+let disp = { sx: 0, sy: 0 };   // 表示中のOCR結果を、現在の映像位置へ動かすための移動量(0-1正規化)
+let query = '', stream = null, track = null;
+let mode = 'live', frozen = false;
+let debug = settings.debug, maxSide = settings.res;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const normQ = s => s.normalize('NFKC').toLowerCase().replace(/\s+/g, '');
+const isBusy = () => shooting || pool.some(p => p.busy);
 
 /* ================= カメラ ================= */
 async function startCamera() {
@@ -174,14 +210,17 @@ async function initOcr() {
   loadingLabel = 'OCRエンジンを読み込み中';
   refreshStatus();
   try {
-    worker = await Tesseract.createWorker(CFG.langs, 1, {
-      logger: m => {
-        if (ready || typeof m.progress !== 'number') return;
-        loadingLabel = `OCRエンジンを読み込み中 ${Math.round(m.progress * 100)}%`;
-        refreshStatus();
-      },
-    });
-    await worker.setParameters({ tessedit_pageseg_mode: psmSel.value });
+    const langs = settings.lang.split('+');
+    const workers = await Promise.all(Array.from({ length: settings.pool }, () =>
+      Tesseract.createWorker(langs, 1, {
+        logger: m => {
+          if (ready || typeof m.progress !== 'number') return;
+          loadingLabel = `OCRエンジンを読み込み中 ${Math.round(m.progress * 100)}%`;
+          refreshStatus();
+        },
+      })));
+    await Promise.all(workers.map(w => w.setParameters({ tessedit_pageseg_mode: settings.psm })));
+    pool = workers.map(w => ({ w, busy: false }));
     ready = true; loadingLabel = '';
   } catch (e) {
     console.error(e);
@@ -190,22 +229,20 @@ async function initOcr() {
   refreshStatus();
 }
 
-// カメラ映像を縮小して取り込む(長辺 side px)
-const frame = document.createElement('canvas'), fctx = frame.getContext('2d');
-function grabFrame(side) {
+// 映像を縮小して「新しいcanvas」に取り込む(並列ジョブ同士で干渉しない)
+function captureFrame(side) {
   const vw = video.videoWidth, vh = video.videoHeight;
   const s = Math.min(1, side / Math.max(vw, vh));
-  frame.width = Math.round(vw * s); frame.height = Math.round(vh * s);
-  fctx.drawImage(video, 0, 0, frame.width, frame.height);
-  return { w: frame.width, h: frame.height };
+  const c = document.createElement('canvas');
+  c.width = Math.round(vw * s); c.height = Math.round(vh * s);
+  c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
+  return c;
 }
 
-// 白黒化+コントラスト自動補正(影・低コントラストでの認識率向上)
-const proc = document.createElement('canvas'), pctx = proc.getContext('2d', { willReadFrequently: true });
-function preprocess(src) {
-  proc.width = src.width; proc.height = src.height;
-  pctx.drawImage(src, 0, 0);
-  const img = pctx.getImageData(0, 0, proc.width, proc.height), d = img.data;
+// 白黒化+コントラスト自動補正(その場で書き換え)
+function preprocess(c) {
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  const img = ctx.getImageData(0, 0, c.width, c.height), d = img.data;
   const hist = new Uint32Array(256), n = d.length / 4;
   for (let i = 0; i < d.length; i += 4) {
     const g = (d[i] * 77 + d[i+1] * 150 + d[i+2] * 29) >> 8;
@@ -220,20 +257,9 @@ function preprocess(src) {
     const g = Math.max(0, Math.min(255, (d[i] - lo) * k));
     d[i] = d[i+1] = d[i+2] = g;
   }
-  pctx.putImageData(img, 0, 0);
-  return proc;
+  ctx.putImageData(img, 0, 0);
+  return c;
 }
-
-const T = CFG.thumbSize, tcv = document.createElement('canvas');
-tcv.width = tcv.height = T;
-const tctx = tcv.getContext('2d', { willReadFrequently: true });
-function thumb() {
-  tctx.drawImage(video, 0, 0, T, T);
-  const d = tctx.getImageData(0, 0, T, T).data, g = new Uint8Array(T * T);
-  for (let i = 0; i < g.length; i++) g[i] = (d[4*i] * 77 + d[4*i+1] * 150 + d[4*i+2] * 29) >> 8;
-  return g;
-}
-function diff(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; }
 
 // Tesseractの結果 → 行ごとの「空白なし正規化文字列」+「1文字ずつのボックス」(0-1正規化)
 function extractLines(data, W, H) {
@@ -279,76 +305,163 @@ function findMatches(q) {
   return res;
 }
 
-async function recognizeCurrentFrame(side) {
-  const { w, h } = grabFrame(side);
-  const img = preprocess(frame);
-  const { data } = await worker.recognize(img, {}, { blocks: true });
-  return { w, h, data };
+/* ================= 動きの追従(OCRの待ち時間を隠す) =================
+   小さな白黒画像で「前フレームから画面がどれだけ平行移動したか」を毎フレーム推定し、
+   枠を同じだけ動かす。OCR開始時点からの移動量をジョブごとに積算しておき、
+   結果が返ってきた時点で「撮影時の位置→現在の位置」へ補正する。 */
+const TW = CFG.trackW; let TH = 90;
+const tcv = document.createElement('canvas');
+const tctx = tcv.getContext('2d', { willReadFrequently: true });
+let prevG = null, latestG = null, ocrRefG = null, trackLost = false;
+const jobs = new Set();
+
+function grabG() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return null;
+  const h = Math.max(24, Math.round(TW * vh / vw));
+  if (tcv.width !== TW || tcv.height !== h) { tcv.width = TW; tcv.height = h; TH = h; prevG = null; ocrRefG = null; }
+  tctx.drawImage(video, 0, 0, TW, TH);
+  const d = tctx.getImageData(0, 0, TW, TH).data, g = new Uint8Array(TW * TH);
+  for (let i = 0; i < g.length; i++) g[i] = (d[4*i] * 77 + d[4*i+1] * 150 + d[4*i+2] * 29) >> 8;
+  return g;
+}
+function diffG(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; }
+
+// cur(x,y) ≒ prev(x-dx, y-dy) となる (dx,dy) をブロックマッチングで探す(サブピクセル補間つき)
+function estimateShift(prev, cur) {
+  const R = CFG.trackRange, m = R + 1, N = 2 * R + 1;
+  const sad = new Float64Array(N * N);
+  let best = Infinity, bi = 0, cnt = 1;
+  for (let j = 0; j < N; j++) {
+    const dy = j - R;
+    for (let i = 0; i < N; i++) {
+      const dx = i - R; let s = 0, c = 0;
+      for (let y = m; y < TH - m; y += 2) {
+        const rc = y * TW, rp = (y - dy) * TW - dx;
+        for (let x = m; x < TW - m; x += 2) {
+          const a = cur[rc + x] - prev[rp + x];
+          s += a < 0 ? -a : a; c++;
+        }
+      }
+      sad[j * N + i] = s; cnt = c;
+      if (s < best) { best = s; bi = j * N + i; }
+    }
+  }
+  const bx = bi % N, by = (bi / N) | 0;
+  let dx = bx - R, dy = by - R;
+  const edge = bx === 0 || bx === N - 1 || by === 0 || by === N - 1;
+  if (!edge) {
+    const s0 = sad[bi], l = sad[bi - 1], r = sad[bi + 1], u = sad[bi - N], d = sad[bi + N];
+    const dnx = l - 2 * s0 + r, dny = u - 2 * s0 + d;
+    if (dnx > 0) dx += 0.5 * (l - r) / dnx;
+    if (dny > 0) dy += 0.5 * (u - d) / dny;
+  }
+  return { dx, dy, lost: edge || best / cnt > CFG.trackLostErr };
 }
 
-// ライブ: 1回ずつ順番に実行
-async function runLiveOcr() {
-  busy = true; refreshStatus();
-  try {
-    const t = thumb();
-    const { w, h, data } = await recognizeCurrentFrame(maxSide);
-    lines = extractLines(data, w, h);
-    ocrThumb = t; needOcr = false; moved = false;
-    afterOcr();
-  } catch (e) { console.error(e); await sleep(1000); }
-  finally { busy = false; refreshStatus(); }
+let lastTick = 0;
+function tick(ts) {
+  requestAnimationFrame(tick);
+  if (mode !== 'live' || frozen || document.hidden || !video.videoWidth || ts - lastTick < 33) return;
+  lastTick = ts;
+  const cur = grabG(); if (!cur) return;
+  latestG = cur;
+  let redraw = false;
+  if (prevG && prevG.length === cur.length) {
+    const e = estimateShift(prevG, cur);
+    if (e.lost !== trackLost) { trackLost = e.lost; redraw = true; }
+    if (!e.lost) {
+      let { dx, dy } = e;
+      if (Math.abs(dx) < 0.2) dx = 0;
+      if (Math.abs(dy) < 0.2) dy = 0;
+      if (dx || dy) {
+        const nx = dx / TW, ny = dy / TH;
+        disp.sx += nx; disp.sy += ny;
+        for (const j of jobs) { j.sx += nx; j.sy += ny; }
+        redraw = true;
+      }
+    }
+  }
+  prevG = cur;
+  if (!ocrRefG || ocrRefG.length !== cur.length || diffG(cur, ocrRefG) > CFG.motionThreshold) needOcr = true;
+  if (redraw) draw();
 }
+requestAnimationFrame(tick);
 
-// 撮影: 高解像度で1枚だけ認識。静止画上に枠を出すので時間差・位置ずれがない
+/* ================= ライト: 並列パイプライン ================= */
+function startJob(slot) {
+  slot.busy = true; needOcr = false;
+  ocrRefG = latestG || grabG();
+  const job = { id: ++seq, sx: 0, sy: 0 };
+  jobs.add(job);
+  const cv = captureFrame(maxSide), W = cv.width, H = cv.height;
+  preprocess(cv);
+  slot.w.recognize(cv, {}, { blocks: true })
+    .then(({ data }) => {
+      if (mode !== 'live' || frozen || job.id <= appliedSeq) return;   // 古い結果は捨てる
+      appliedSeq = job.id;
+      lines = extractLines(data, W, H);
+      disp = { sx: job.sx, sy: job.sy };                               // 撮影時→現在位置へ補正
+      afterOcr();
+    })
+    .catch(e => console.error(e))
+    .finally(() => { jobs.delete(job); slot.busy = false; refreshStatus(); });
+  refreshStatus();
+}
+let seq = 0, appliedSeq = 0;
+
+async function dispatchLoop() {
+  for (;;) {
+    await sleep(30);
+    if (mode !== 'live' || !ready || shooting || document.hidden || !video.videoWidth) continue;
+    if (!needOcr) continue;
+    if (!query && lines.length) continue;           // キーワード未入力ならOCRしない(省電力)
+    const slot = pool.find(p => !p.busy);
+    if (!slot) continue;
+    startJob(slot);
+  }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { needOcr = true; prevG = null; } });
+
+/* ================= 撮影モード ================= */
+async function acquire() {
+  for (;;) {
+    const slot = pool.find(p => !p.busy);
+    if (slot) { slot.busy = true; return slot; }
+    await sleep(30);
+  }
+}
 async function shoot() {
-  if (!ready || busy || !video.videoWidth) return;
-  busy = true; lines = []; matches = []; refreshStatus();
+  if (!ready || shooting || !video.videoWidth) return;
+  shooting = true; lines = []; matches = []; refreshStatus();
+  let slot;
   try {
-    const side = Math.max(maxSide, CFG.shotMinSide);
-    const { w, h } = grabFrame(side);
-    still.width = w; still.height = h;
-    still.getContext('2d').drawImage(frame, 0, 0);
-    still.style.display = 'block'; frozen = true;
+    const cv = captureFrame(Math.max(maxSide, CFG.shotMinSide));
+    still.width = cv.width; still.height = cv.height;
+    still.getContext('2d').drawImage(cv, 0, 0);
+    still.style.display = 'block'; frozen = true; disp = { sx: 0, sy: 0 };
     shutterBtn.textContent = '再撮影';
     draw();
-    const img = preprocess(frame);
-    const { data } = await worker.recognize(img, {}, { blocks: true });
-    lines = extractLines(data, w, h);
-    afterOcr();
+    preprocess(cv);
+    slot = await acquire();
+    const { data } = await slot.w.recognize(cv, {}, { blocks: true });
+    if (frozen) { lines = extractLines(data, cv.width, cv.height); afterOcr(); }
   } catch (e) { console.error(e); }
-  finally { busy = false; refreshStatus(); }
+  finally { if (slot) slot.busy = false; shooting = false; refreshStatus(); }
 }
 function unfreeze() {
   frozen = false; still.style.display = 'none';
   shutterBtn.textContent = '撮影';
-  lines = []; matches = []; updateDebugText(); draw(); refreshStatus();
+  lines = []; matches = []; disp = { sx: 0, sy: 0 }; ocrRefG = null; prevG = null; needOcr = true;
+  updateDebugText(); draw(); refreshStatus();
 }
 shutterBtn.onclick = () => { if (frozen) unfreeze(); else shoot(); };
-
-async function ocrLoop() {
-  for (;;) {
-    await sleep(120);
-    if (mode !== 'live' || !ready || busy || document.hidden || !video.videoWidth) continue;
-    if (!needOcr) continue;
-    if (!query && lines.length) continue;
-    await runLiveOcr();
-  }
-}
-
-setInterval(() => {
-  if (mode !== 'live' || document.hidden || !video.videoWidth) return;
-  if (!ocrThumb) { needOcr = true; return; }
-  const m = diff(thumb(), ocrThumb) > CFG.motionThreshold;
-  if (m) needOcr = true;
-  if (m !== moved) { moved = m; draw(); }
-}, CFG.monitorMs);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) needOcr = true; });
 
 /* ================= 描画 ================= */
 function afterOcr() { updateDebugText(); rematch(); }
 function rematch() { matches = findMatches(query); refreshStatus(); draw(); }
 
-// 映像(または静止画)上の正規化座標 → 画面座標。object-fit: cover と同じ計算
+// 正規化座標 → 画面座標(object-fit: cover と同じ計算)。ライト中は追従の移動量を加える
 function draw() {
   const dpr = window.devicePixelRatio || 1;
   const cw = overlay.clientWidth, ch = overlay.clientHeight;
@@ -363,15 +476,16 @@ function draw() {
   if (!sw || !sh) return;
   const s = Math.max(cw / sw, ch / sh);
   const ox = (cw - sw * s) / 2, oy = (ch - sh * s) / 2;
-  const R = r => [r.x0 * sw * s + ox, r.y0 * sh * s + oy, (r.x1 - r.x0) * sw * s, (r.y1 - r.y0) * sh * s];
+  const mx = frozen ? 0 : disp.sx, my = frozen ? 0 : disp.sy;
+  const R = r => [(r.x0 + mx) * sw * s + ox, (r.y0 + my) * sh * s + oy, (r.x1 - r.x0) * sw * s, (r.y1 - r.y0) * sh * s];
 
-  if (debug) {                                   // OCRが認識した全文字の枠(水色)
+  if (debug) {
     octx.lineWidth = 1; octx.strokeStyle = 'rgba(0,220,255,.8)';
     for (const ln of lines) for (const b of ln.boxes) octx.strokeRect(...R(b));
   }
   if (!matches.length) return;
   const pad = 3;
-  octx.globalAlpha = (!frozen && moved) ? 0.35 : 1;
+  octx.globalAlpha = (!frozen && trackLost) ? 0.35 : 1;      // 追従を見失っている間は薄く
   octx.lineWidth = 3; octx.strokeStyle = '#ffd600'; octx.fillStyle = 'rgba(255,214,0,.25)';
   for (const r of matches) {
     const [x, y, w, h] = R(r);
@@ -387,10 +501,10 @@ video.addEventListener('loadedmetadata', draw);
 function refreshStatus() {
   let text, dot = false;
   if (!ready) { text = loadingLabel || '起動中…'; dot = !loadingLabel.includes('失敗'); }
-  else if (mode === 'shot' && !frozen && !busy) text = '「撮影」で文字を読み取ります';
-  else if (busy) { text = '解析中…'; dot = true; }
+  else if (mode === 'shot' && !frozen && !isBusy()) text = '「撮影」で文字を読み取ります';
+  else if (mode === 'shot' && isBusy()) { text = '解析中…'; dot = true; }
   else if (!query) text = 'キーワードを入力してください';
-  else text = matches.length ? `${matches.length}件ヒット` : '見つかりません';
+  else { text = matches.length ? `${matches.length}件ヒット` : '見つかりません'; dot = isBusy(); }
   statusText.textContent = text;
   statusDot.classList.toggle('hidden', !dot);
 }
@@ -405,10 +519,10 @@ function updateDebugText() {
 
 function setMode(m) {
   mode = m;
-  if (m === 'live') unfreeze();
+  unfreeze();
   modeBtn.textContent = 'モード: ' + (m === 'live' ? 'ライブ' : '撮影');
   shutterBtn.style.display = m === 'shot' ? 'inline-block' : 'none';
-  needOcr = true; refreshStatus();
+  refreshStatus();
 }
 modeBtn.onclick = () => setMode(mode === 'live' ? 'shot' : 'live');
 
@@ -417,17 +531,20 @@ gearBtn.onclick = () => {
   panel.style.display = open ? 'block' : 'none';
   gearBtn.classList.toggle('on', open);
 };
+langSel.onchange = () => { store.set('lang', langSel.value); location.reload(); };
+poolSel.onchange = () => { store.set('pool', poolSel.value); location.reload(); };
 psmSel.onchange = async () => {
-  if (worker) await worker.setParameters({ tessedit_pageseg_mode: psmSel.value });
+  store.set('psm', psmSel.value);
+  await Promise.all(pool.map(p => p.w.setParameters({ tessedit_pageseg_mode: psmSel.value })));
   needOcr = true;
 };
-resSel.onchange = () => { maxSide = +resSel.value; needOcr = true; };
-dbgChk.onchange = () => { debug = dbgChk.checked; updateDebugText(); draw(); };
+resSel.onchange = () => { maxSide = +resSel.value; store.set('res', maxSide); needOcr = true; };
+dbgChk.onchange = () => { debug = dbgChk.checked; store.set('debug', debug ? '1' : '0'); updateDebugText(); draw(); };
 
 input.addEventListener('input', () => {
   query = normQ(input.value);
   clearBtn.style.display = input.value ? 'block' : 'none';
-  rematch();
+  rematch();                                   // キャッシュ済みOCR結果から即座に再検索
 });
 input.addEventListener('keydown', e => { if (e.key === 'Enter') input.blur(); });
 clearBtn.onclick = () => { input.value = ''; input.dispatchEvent(new Event('input')); };
@@ -445,7 +562,8 @@ if (window.visualViewport) {
 /* ================= 起動 ================= */
 startCamera();
 initOcr();
-ocrLoop();
+dispatchLoop();
+updateDebugText();
 refreshStatus();
 </script>
 </body>
